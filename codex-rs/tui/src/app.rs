@@ -73,6 +73,7 @@ use crate::test_support::test_path_display;
 use crate::token_usage::TokenUsage;
 use crate::transcript_reflow::TranscriptReflowState;
 use crate::tui;
+use crate::tui::MouseSelectionCopyResult;
 use crate::tui::TuiEvent;
 use crate::update_action::UpdateAction;
 use crate::version::CODEX_CLI_VERSION;
@@ -1067,6 +1068,27 @@ See the Codex keymap documentation for supported actions and examples."
             }
         }
 
+        if let TuiEvent::Mouse(mouse_event) = &event {
+            let preferred_selection_area = self.chat_widget.composer_selection_area();
+            match tui.handle_mouse_event(*mouse_event, preferred_selection_area) {
+                MouseSelectionCopyResult::None => {}
+                MouseSelectionCopyResult::Copied => {
+                    self.chat_widget
+                        .add_to_history(history_cell::new_info_event(
+                            "Copied to Clipboard".to_string(),
+                            /*hint*/ None,
+                        ));
+                }
+                MouseSelectionCopyResult::Failed(error) => {
+                    self.chat_widget
+                        .add_to_history(history_cell::new_error_event(format!(
+                            "Copy failed: {error}"
+                        )));
+                }
+            }
+            return Ok(AppRunControl::Continue);
+        }
+
         if self.overlay.is_some() {
             let _ = self.handle_backtrack_overlay_event(tui, event).await?;
         } else {
@@ -1082,6 +1104,7 @@ See the Codex keymap documentation for supported actions and examples."
                     let pasted = pasted.replace("\r", "\n");
                     self.chat_widget.handle_paste(pasted);
                 }
+                TuiEvent::Mouse(_) => {}
                 TuiEvent::Draw | TuiEvent::Resize => {
                     if self.backtrack_render_pending {
                         self.backtrack_render_pending = false;

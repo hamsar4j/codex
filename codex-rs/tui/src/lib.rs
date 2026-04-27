@@ -142,6 +142,7 @@ mod mention_codec;
 mod model_catalog;
 mod model_migration;
 mod motion;
+mod mouse_line_selection;
 mod multi_agents;
 mod notifications;
 #[cfg(any(not(debug_assertions), test))]

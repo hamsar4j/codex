@@ -224,6 +224,7 @@ use codex_file_search::FileMatch;
 #[cfg(test)]
 use codex_plugin::AppConnectorId;
 use codex_plugin::PluginCapabilitySummary;
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -326,6 +327,7 @@ impl ChatComposerConfig {
 pub(crate) struct ChatComposer {
     textarea: TextArea,
     textarea_state: RefCell<TextAreaState>,
+    last_textarea_rect: Cell<Option<Rect>>,
     is_bash_mode: bool,
     active_popup: ActivePopup,
     app_event_tx: AppEventSender,
@@ -523,6 +525,7 @@ impl ChatComposer {
         let mut this = Self {
             textarea: TextArea::new(),
             textarea_state: RefCell::new(TextAreaState::default()),
+            last_textarea_rect: Cell::new(None),
             is_bash_mode: false,
             active_popup: ActivePopup::None,
             app_event_tx,
@@ -828,6 +831,12 @@ impl ChatComposer {
         let [_, _, textarea_rect, _] = self.layout_areas(area);
         let state = *self.textarea_state.borrow();
         self.textarea.cursor_pos_with_state(textarea_rect, state)
+    }
+
+    pub(crate) fn last_textarea_rect(&self) -> Option<Rect> {
+        self.last_textarea_rect
+            .get()
+            .filter(|rect| !rect.is_empty())
     }
     /// Returns true if the composer currently contains no user-entered input.
     pub(crate) fn is_empty(&self) -> bool {
@@ -4467,6 +4476,7 @@ impl ChatComposer {
         buf: &mut Buffer,
         mask_char: Option<char>,
     ) {
+        self.last_textarea_rect.set(Some(textarea_rect));
         let is_zellij = self.is_zellij;
         let style = user_message_style();
         let textarea_style = style.fg(ratatui::style::Color::Reset);

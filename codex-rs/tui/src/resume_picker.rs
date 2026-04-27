@@ -247,6 +247,7 @@ async fn run_session_picker_with_loader(
                             return Ok(sel);
                         }
                     }
+                    TuiEvent::Mouse(_) => {}
                     TuiEvent::Draw | TuiEvent::Resize => {
                         if let Ok(size) = alt.tui.terminal.size() {
                             let list_height = size.height.saturating_sub(4) as usize;

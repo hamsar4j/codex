@@ -266,7 +266,7 @@ where
     }
 
     /// Gets the previous buffer as a reference.
-    fn previous_buffer(&self) -> &Buffer {
+    pub(crate) fn previous_buffer(&self) -> &Buffer {
         &self.buffers[1 - self.current]
     }
 

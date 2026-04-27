@@ -5275,6 +5275,10 @@ impl ChatWidget {
         self.bottom_pane.composer_text_with_pending()
     }
 
+    pub(crate) fn composer_selection_area(&self) -> Option<Rect> {
+        self.bottom_pane.composer_selection_area()
+    }
+
     pub(crate) fn apply_external_edit(&mut self, text: String) {
         self.bottom_pane.apply_external_edit(text);
         self.refresh_plan_mode_nudge();

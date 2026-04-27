@@ -3,6 +3,7 @@ use crate::color::is_light;
 use crate::terminal_palette::best_color;
 use crate::terminal_palette::default_bg;
 use ratatui::style::Color;
+use ratatui::style::Modifier;
 use ratatui::style::Style;
 
 pub fn user_message_style() -> Style {
@@ -11,6 +12,12 @@ pub fn user_message_style() -> Style {
 
 pub fn proposed_plan_style() -> Style {
     proposed_plan_style_for(default_bg())
+}
+
+pub(crate) fn text_selection_style() -> Style {
+    Style::default()
+        .bg(Color::DarkGray)
+        .add_modifier(Modifier::REVERSED)
 }
 
 /// Returns the style for a user-authored message using the provided terminal background.

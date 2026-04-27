@@ -800,6 +800,13 @@ impl BottomPane {
         self.composer.input_enabled()
     }
 
+    pub(crate) fn composer_selection_area(&self) -> Option<Rect> {
+        self.view_stack
+            .is_empty()
+            .then(|| self.composer.last_textarea_rect())
+            .flatten()
+    }
+
     pub(crate) fn composer_pending_pastes(&self) -> Vec<(String, String)> {
         self.composer.pending_pastes()
     }

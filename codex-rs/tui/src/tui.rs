@@ -17,9 +17,12 @@ use crossterm::SynchronizedUpdate;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::DisableBracketedPaste;
 use crossterm::event::DisableFocusChange;
+use crossterm::event::DisableMouseCapture;
 use crossterm::event::EnableBracketedPaste;
 use crossterm::event::EnableFocusChange;
+use crossterm::event::EnableMouseCapture;
 use crossterm::event::KeyEvent;
+use crossterm::event::MouseEvent;
 use crossterm::terminal::EnterAlternateScreen;
 use crossterm::terminal::LeaveAlternateScreen;
 #[cfg(not(unix))]
@@ -40,6 +43,11 @@ use tokio_stream::Stream;
 pub use self::frame_requester::FrameRequester;
 use crate::custom_terminal;
 use crate::custom_terminal::Terminal as CustomTerminal;
+use crate::insert_history::HistoryRow;
+use crate::mouse_line_selection::MouseLineSelection;
+use crate::mouse_line_selection::MouseLineSelectionOutcome;
+use crate::mouse_line_selection::MouseLineSelectionSource;
+use crate::mouse_line_selection::SelectionRange;
 use crate::notifications::DesktopNotificationBackend;
 use crate::notifications::detect_backend;
 use crate::tui::event_stream::EventBroker;
@@ -105,6 +113,7 @@ mod tests {
 
 pub fn set_modes() -> Result<()> {
     execute!(stdout(), EnableBracketedPaste)?;
+    execute!(stdout(), EnableMouseCapture)?;
 
     enable_raw_mode()?;
     // Enable keyboard enhancement flags so modifiers for keys like Enter are disambiguated.
@@ -183,6 +192,7 @@ fn restore_common(
     }
 
     let mut first_error = execute!(stdout(), DisableBracketedPaste).err();
+    let _ = execute!(stdout(), DisableMouseCapture);
     let _ = execute!(stdout(), DisableFocusChange);
     if matches!(raw_mode_restore, RawModeRestore::Disable)
         && let Err(err) = disable_raw_mode()
@@ -355,6 +365,8 @@ pub enum TuiEvent {
     Key(KeyEvent),
     /// A bracketed paste payload normalized by the app layer before it reaches the composer.
     Paste(String),
+    /// A terminal mouse event after mouse capture has been enabled.
+    Mouse(MouseEvent),
     /// A terminal size notification that should be handled as resize-sensitive draw work.
     ///
     /// Resize is separate from `Draw` so the app can run feature-gated pre-render logic without
@@ -364,12 +376,20 @@ pub enum TuiEvent {
     Draw,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MouseSelectionCopyResult {
+    None,
+    Copied,
+    Failed(String),
+}
+
 pub struct Tui {
     frame_requester: FrameRequester,
     draw_tx: broadcast::Sender<()>,
     event_broker: Arc<EventBroker>,
     pub(crate) terminal: Terminal,
     pending_history_lines: Vec<Line<'static>>,
+    history_line_cache: Vec<HistoryRow>,
     alt_saved_viewport: Option<ratatui::layout::Rect>,
     #[cfg(unix)]
     suspend_context: SuspendContext,
@@ -380,9 +400,24 @@ pub struct Tui {
     enhanced_keys_supported: bool,
     notification_backend: Option<DesktopNotificationBackend>,
     notification_condition: NotificationCondition,
+    mouse_line_selection: MouseLineSelection,
+    selection_clipboard_lease: Option<crate::clipboard_copy::ClipboardLease>,
     is_zellij: bool,
     // When false, enter_alt_screen() becomes a no-op (for Zellij scrollback support)
     alt_screen_enabled: bool,
+}
+
+fn trim_history_line_cache(history_line_cache: &mut Vec<HistoryRow>, visible_history_rows: u16) {
+    let max_rows = visible_history_rows as usize;
+    if max_rows == 0 {
+        history_line_cache.clear();
+        return;
+    }
+
+    let overflow = history_line_cache.len().saturating_sub(max_rows);
+    if overflow > 0 {
+        history_line_cache.drain(0..overflow);
+    }
 }
 
 impl Tui {
@@ -408,6 +443,7 @@ impl Tui {
             event_broker: Arc::new(EventBroker::new()),
             terminal,
             pending_history_lines: vec![],
+            history_line_cache: vec![],
             alt_saved_viewport: None,
             #[cfg(unix)]
             suspend_context: SuspendContext::new(),
@@ -416,6 +452,8 @@ impl Tui {
             enhanced_keys_supported,
             notification_backend: Some(detect_backend(NotificationMethod::default())),
             notification_condition: NotificationCondition::default(),
+            mouse_line_selection: MouseLineSelection::default(),
+            selection_clipboard_lease: None,
             is_zellij,
             alt_screen_enabled: true,
         }
@@ -525,6 +563,36 @@ impl Tui {
         }
     }
 
+    pub(crate) fn handle_mouse_event(
+        &mut self,
+        event: MouseEvent,
+        preferred_selection_area: Option<Rect>,
+    ) -> MouseSelectionCopyResult {
+        let source = MouseLineSelectionSource::new_with_preferred_area(
+            self.terminal.previous_buffer(),
+            &self.history_line_cache,
+            preferred_selection_area,
+        );
+        let outcome = self.mouse_line_selection.handle_mouse_event(event, source);
+        match outcome {
+            MouseLineSelectionOutcome::None => MouseSelectionCopyResult::None,
+            MouseLineSelectionOutcome::Redraw => {
+                self.frame_requester().schedule_frame();
+                MouseSelectionCopyResult::None
+            }
+            MouseLineSelectionOutcome::Copy(text) => {
+                self.frame_requester().schedule_frame();
+                match crate::clipboard_copy::copy_to_clipboard(&text) {
+                    Ok(lease) => {
+                        self.selection_clipboard_lease = lease;
+                        MouseSelectionCopyResult::Copied
+                    }
+                    Err(error) => MouseSelectionCopyResult::Failed(error),
+                }
+            }
+        }
+    }
+
     pub fn event_stream(&self) -> Pin<Box<dyn Stream<Item = TuiEvent> + Send + 'static>> {
         #[cfg(unix)]
         let stream = TuiEventStream::new(
@@ -588,6 +656,7 @@ impl Tui {
 
     pub fn clear_pending_history_lines(&mut self) {
         self.pending_history_lines.clear();
+        self.history_line_cache.clear();
     }
 
     /// Resize the inline viewport to `height` rows, scrolling content above it if
@@ -699,19 +768,55 @@ impl Tui {
     fn flush_pending_history_lines(
         terminal: &mut Terminal,
         pending_history_lines: &mut Vec<Line<'static>>,
+        history_line_cache: &mut Vec<HistoryRow>,
         is_zellij: bool,
     ) -> Result<bool> {
         if pending_history_lines.is_empty() {
             return Ok(false);
         }
 
+        let history_rows = crate::insert_history::history_lines_to_rows(
+            pending_history_lines,
+            terminal.viewport_area.width.max(1) as usize,
+        );
         crate::insert_history::insert_history_lines_with_mode(
             terminal,
             pending_history_lines.clone(),
             crate::insert_history::InsertHistoryMode::new(is_zellij),
         )?;
         pending_history_lines.clear();
+        history_line_cache.extend(history_rows);
+        trim_history_line_cache(history_line_cache, terminal.visible_history_rows());
         Ok(is_zellij)
+    }
+
+    fn render_history_line_selection(
+        terminal: &mut Terminal,
+        history_line_cache: &[HistoryRow],
+        selected_range: Option<SelectionRange>,
+    ) -> Result<()> {
+        let visible_rows = terminal.visible_history_rows() as usize;
+        if visible_rows == 0 || history_line_cache.is_empty() {
+            return Ok(());
+        }
+
+        let row_count = visible_rows.min(history_line_cache.len());
+        let rows = &history_line_cache[history_line_cache.len() - row_count..];
+        let top = terminal
+            .viewport_area
+            .top()
+            .saturating_sub(row_count as u16);
+        let wrap_width = terminal.viewport_area.width.max(1) as usize;
+        let restore_cursor = terminal.last_known_cursor_pos;
+        let viewport_area = terminal.viewport_area;
+        crate::insert_history::render_history_rows(
+            terminal.backend_mut(),
+            rows,
+            top,
+            |row| selected_range.and_then(|range| range.columns_for_row(row, viewport_area)),
+            wrap_width,
+            restore_cursor,
+        )
     }
 
     pub fn draw(
@@ -747,6 +852,7 @@ impl Tui {
             needs_full_repaint |= Self::flush_pending_history_lines(
                 terminal,
                 &mut self.pending_history_lines,
+                &mut self.history_line_cache,
                 self.is_zellij,
             )?;
 
@@ -768,8 +874,15 @@ impl Tui {
                 self.suspend_context.set_cursor_y(inline_area_bottom);
             }
 
+            Self::render_history_line_selection(
+                terminal,
+                &self.history_line_cache,
+                self.mouse_line_selection.active_range(),
+            )?;
+
             terminal.draw(|frame| {
                 draw_fn(frame);
+                self.mouse_line_selection.render(frame.area(), frame.buffer);
             })
         })?
     }
@@ -803,6 +916,7 @@ impl Tui {
             let flushed_history = Self::flush_pending_history_lines(
                 terminal,
                 &mut self.pending_history_lines,
+                &mut self.history_line_cache,
                 self.is_zellij,
             )?;
             needs_full_repaint |= flushed_history;
@@ -825,8 +939,15 @@ impl Tui {
                 self.suspend_context.set_cursor_y(inline_area_bottom);
             }
 
+            Self::render_history_line_selection(
+                terminal,
+                &self.history_line_cache,
+                self.mouse_line_selection.active_range(),
+            )?;
+
             terminal.draw(|frame| {
                 draw_fn(frame);
+                self.mouse_line_selection.render(frame.area(), frame.buffer);
             })
         })?
     }

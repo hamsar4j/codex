@@ -8,6 +8,7 @@ use std::fmt;
 use std::io;
 use std::io::Write;
 
+use crate::style::text_selection_style;
 use crate::wrapping::RtOptions;
 use crate::wrapping::adaptive_wrap_line;
 use crate::wrapping::line_contains_url_like;
@@ -28,12 +29,15 @@ use crossterm::style::SetColors;
 use crossterm::style::SetForegroundColor;
 use crossterm::terminal::Clear;
 use crossterm::terminal::ClearType;
+use ratatui::layout::Position;
 use ratatui::layout::Size;
 use ratatui::prelude::Backend;
 use ratatui::style::Color;
 use ratatui::style::Modifier;
+use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
+use unicode_width::UnicodeWidthChar;
 
 /// Selects the terminal escape strategy for inserting history lines above the viewport.
 ///
@@ -45,6 +49,12 @@ use ratatui::text::Span;
 pub enum InsertHistoryMode {
     Standard,
     Zellij,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HistoryRow {
+    pub(crate) line: Line<'static>,
+    pub(crate) plain_text: String,
 }
 
 impl InsertHistoryMode {
@@ -218,6 +228,169 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+fn history_lines_to_plain_rows(lines: &[Line<'static>], wrap_width: usize) -> Vec<String> {
+    history_lines_to_rows(lines, wrap_width)
+        .into_iter()
+        .map(|row| row.plain_text)
+        .collect()
+}
+
+pub(crate) fn history_lines_to_rows(lines: &[Line<'static>], wrap_width: usize) -> Vec<HistoryRow> {
+    let wrap_width = wrap_width.max(1);
+    let mut rows = Vec::new();
+
+    for line in lines {
+        let wrapped_lines: Vec<Line<'static>> =
+            if line_contains_url_like(line) && !line_has_mixed_url_and_non_url_tokens(line) {
+                vec![line.clone()]
+            } else {
+                adaptive_wrap_line(line, RtOptions::new(wrap_width))
+                    .into_iter()
+                    .map(|wrapped_line| line_to_static(&wrapped_line))
+                    .collect()
+            };
+        for wrapped_line in wrapped_lines {
+            for physical_line in styled_physical_rows(&wrapped_line, wrap_width) {
+                rows.push(HistoryRow {
+                    plain_text: line_plain_text(&physical_line).trim_end().to_string(),
+                    line: physical_line,
+                });
+            }
+        }
+    }
+
+    rows
+}
+
+pub(crate) fn render_history_rows<W: Write>(
+    writer: &mut W,
+    rows: &[HistoryRow],
+    top: u16,
+    selected_columns_for_row: impl Fn(u16) -> Option<(u16, u16)>,
+    wrap_width: usize,
+    restore_cursor: Position,
+) -> io::Result<()> {
+    let wrap_width = wrap_width.max(1);
+    for (index, row) in rows.iter().enumerate() {
+        let y = top.saturating_add(index as u16);
+        queue!(writer, MoveTo(/*x*/ 0, y))?;
+        if let Some((start, end)) = selected_columns_for_row(y) {
+            write_history_line(
+                writer,
+                &highlighted_line(&row.line, start as usize, end as usize),
+                wrap_width,
+            )?;
+        } else {
+            write_history_line(writer, &row.line, wrap_width)?;
+        }
+    }
+    queue!(writer, MoveTo(restore_cursor.x, restore_cursor.y))?;
+    Ok(())
+}
+
+fn line_to_static(line: &Line<'_>) -> Line<'static> {
+    Line {
+        style: line.style,
+        alignment: line.alignment,
+        spans: line
+            .spans
+            .iter()
+            .map(|span| Span::styled(span.content.to_string(), span.style))
+            .collect(),
+    }
+}
+
+fn line_plain_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>()
+}
+
+fn styled_physical_rows(line: &Line<'_>, wrap_width: usize) -> Vec<Line<'static>> {
+    let wrap_width = wrap_width.max(1);
+    if line.width() == 0 {
+        return vec![line_to_static(line)];
+    }
+
+    let mut rows = Vec::new();
+    let mut row_spans: Vec<Span<'static>> = Vec::new();
+    let mut row_width = 0usize;
+
+    for span in &line.spans {
+        for ch in span.content.chars() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if row_width > 0 && row_width + ch_width > wrap_width {
+                rows.push(Line {
+                    style: line.style,
+                    alignment: line.alignment,
+                    spans: row_spans,
+                });
+                row_spans = Vec::new();
+                row_width = 0;
+            }
+            push_char_span(&mut row_spans, ch, span.style);
+            row_width += ch_width;
+            if row_width >= wrap_width {
+                rows.push(Line {
+                    style: line.style,
+                    alignment: line.alignment,
+                    spans: row_spans,
+                });
+                row_spans = Vec::new();
+                row_width = 0;
+            }
+        }
+    }
+
+    if !row_spans.is_empty() {
+        rows.push(Line {
+            style: line.style,
+            alignment: line.alignment,
+            spans: row_spans,
+        });
+    }
+
+    rows
+}
+
+fn push_char_span(spans: &mut Vec<Span<'static>>, ch: char, style: Style) {
+    if let Some(last) = spans.last_mut()
+        && last.style == style
+    {
+        last.content.to_mut().push(ch);
+        return;
+    }
+    spans.push(Span::styled(ch.to_string(), style));
+}
+
+fn highlighted_line(line: &Line<'static>, start_column: usize, end_column: usize) -> Line<'static> {
+    let highlight = text_selection_style();
+    let mut column = 0usize;
+    let mut spans = Vec::new();
+    for span in &line.spans {
+        for ch in span.content.chars() {
+            let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            let next_column = column + width;
+            let selected = next_column > start_column && column < end_column;
+            let style = if selected {
+                span.style.patch(highlight)
+            } else {
+                span.style
+            };
+            push_char_span(&mut spans, ch, style);
+            column = next_column;
+        }
+    }
+
+    Line {
+        style: line.style,
+        alignment: line.alignment,
+        spans,
+    }
 }
 
 /// Render a single wrapped history line: clear continuation rows for wide lines,
@@ -442,6 +615,59 @@ mod tests {
             String::from_utf8(actual).unwrap(),
             String::from_utf8(expected).unwrap()
         );
+    }
+
+    #[test]
+    fn history_lines_to_plain_rows_wraps_output_rows() {
+        let rows = history_lines_to_plain_rows(&[Line::from("alpha beta")], /*wrap_width*/ 5);
+
+        assert_eq!(rows, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[test]
+    fn history_lines_to_plain_rows_splits_url_physical_rows() {
+        let rows = history_lines_to_plain_rows(
+            &[Line::from("https://example.test")],
+            /*wrap_width*/ 8,
+        );
+
+        assert_eq!(
+            rows,
+            vec![
+                "https://".to_string(),
+                "example.".to_string(),
+                "test".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn render_history_rows_applies_selection_background_to_selected_columns() {
+        let width: u16 = 20;
+        let mut backend = VT100Backend::new(width, /*height*/ 3);
+        let rows =
+            history_lines_to_rows(&[Line::from("first"), Line::from("second")], width as usize);
+
+        render_history_rows(
+            &mut backend,
+            &rows,
+            /*top*/ 0,
+            |row| (row == 1).then_some((/*start*/ 1, /*end*/ 4)),
+            width as usize,
+            Position::new(/*x*/ 0, /*y*/ 0),
+        )
+        .expect("render history rows");
+
+        let screen = backend.vt100().screen();
+        let highlighted_cell = screen.cell(/*row*/ 1, /*col*/ 1).unwrap();
+        let plain_cell = screen.cell(/*row*/ 0, /*col*/ 0).unwrap();
+        let unselected_same_row_cell = screen.cell(/*row*/ 1, /*col*/ 4).unwrap();
+        assert_ne!(highlighted_cell.bgcolor(), vt100::Color::Default);
+        assert!(highlighted_cell.inverse());
+        assert_eq!(plain_cell.bgcolor(), vt100::Color::Default);
+        assert!(!plain_cell.inverse());
+        assert_eq!(unselected_same_row_cell.bgcolor(), vt100::Color::Default);
+        assert!(!unselected_same_row_cell.inverse());
     }
 
     #[test]
