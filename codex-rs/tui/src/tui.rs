@@ -3,6 +3,7 @@ use std::future::Future;
 use std::io::IsTerminal;
 use std::io::Result;
 use std::io::Stdout;
+use std::io::Write;
 use std::io::stdin;
 use std::io::stdout;
 use std::panic;
@@ -43,6 +44,7 @@ use tokio_stream::Stream;
 pub use self::frame_requester::FrameRequester;
 use crate::custom_terminal;
 use crate::custom_terminal::Terminal as CustomTerminal;
+use crate::insert_history::HistoryLineWrapPolicy;
 use crate::insert_history::HistoryRow;
 use crate::mouse_line_selection::MouseLineSelection;
 use crate::mouse_line_selection::MouseLineSelectionOutcome;
@@ -81,10 +83,25 @@ fn should_emit_notification(condition: NotificationCondition, terminal_focused: 
     }
 }
 
+impl Drop for Tui {
+    fn drop(&mut self) {
+        if let Err(err) = self.clear_ambient_pet_image() {
+            tracing::debug!(error = %err, "failed to clear ambient pet image on TUI drop");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
+    use super::clear_for_viewport_change;
     use super::should_emit_notification;
+    use crate::custom_terminal::Terminal as CustomTerminal;
+    use crate::test_backend::VT100Backend;
     use codex_config::types::NotificationCondition;
+    use ratatui::layout::Position;
+    use ratatui::layout::Rect;
 
     #[test]
     fn unfocused_notification_condition_is_suppressed_when_focused() {
@@ -108,6 +125,47 @@ mod tests {
             NotificationCondition::Unfocused,
             /*terminal_focused*/ false
         ));
+    }
+
+    #[test]
+    fn first_viewport_change_clears_from_new_viewport_when_old_viewport_is_empty() {
+        let width = 12;
+        let height = 4;
+        let backend = VT100Backend::new(width, height);
+        let mut terminal =
+            CustomTerminal::with_options_and_cursor_position(backend, Position { x: 0, y: 1 })
+                .expect("terminal");
+        write!(
+            terminal.backend_mut(),
+            "shell line\r\nstale cells\r\nmore stale"
+        )
+        .expect("prefill terminal");
+
+        clear_for_viewport_change(
+            &mut terminal,
+            Rect::new(
+                /*x*/ 0,
+                /*y*/ 1,
+                /*width*/ width,
+                /*height*/ height - 1,
+            ),
+        )
+        .expect("clear transition");
+
+        let rows: Vec<String> = terminal
+            .backend()
+            .vt100()
+            .screen()
+            .rows(/*start*/ 0, width)
+            .collect();
+        assert!(
+            rows[0].contains("shell line"),
+            "expected content before the viewport to remain visible, rows: {rows:?}"
+        );
+        assert!(
+            !rows.iter().skip(1).any(|row| row.contains("stale")),
+            "expected stale cells inside the new viewport to be cleared, rows: {rows:?}"
+        );
     }
 }
 
@@ -388,8 +446,10 @@ pub struct Tui {
     draw_tx: broadcast::Sender<()>,
     event_broker: Arc<EventBroker>,
     pub(crate) terminal: Terminal,
-    pending_history_lines: Vec<Line<'static>>,
+    pending_history_lines: Vec<PendingHistoryLines>,
     history_line_cache: Vec<HistoryRow>,
+    ambient_pet_image_state: crate::pets::PetImageRenderState,
+    pet_picker_preview_image_state: crate::pets::PetImageRenderState,
     alt_saved_viewport: Option<ratatui::layout::Rect>,
     #[cfg(unix)]
     suspend_context: SuspendContext,
@@ -405,6 +465,23 @@ pub struct Tui {
     is_zellij: bool,
     // When false, enter_alt_screen() becomes a no-op (for Zellij scrollback support)
     alt_screen_enabled: bool,
+}
+
+struct PendingHistoryLines {
+    lines: Vec<Line<'static>>,
+    wrap_policy: HistoryLineWrapPolicy,
+}
+
+fn clear_for_viewport_change<B>(terminal: &mut CustomTerminal<B>, new_area: Rect) -> Result<()>
+where
+    B: Backend + Write,
+{
+    let clear_position = if terminal.viewport_area.is_empty() {
+        new_area.as_position()
+    } else {
+        terminal.viewport_area.as_position()
+    };
+    terminal.clear_after_position(clear_position)
 }
 
 fn trim_history_line_cache(history_line_cache: &mut Vec<HistoryRow>, visible_history_rows: u16) {
@@ -444,6 +521,8 @@ impl Tui {
             terminal,
             pending_history_lines: vec![],
             history_line_cache: vec![],
+            ambient_pet_image_state: crate::pets::PetImageRenderState::default(),
+            pet_picker_preview_image_state: crate::pets::PetImageRenderState::default(),
             alt_saved_viewport: None,
             #[cfg(unix)]
             suspend_context: SuspendContext::new(),
@@ -650,7 +729,25 @@ impl Tui {
     }
 
     pub fn insert_history_lines(&mut self, lines: Vec<Line<'static>>) {
-        self.pending_history_lines.extend(lines);
+        self.insert_history_lines_with_wrap_policy(lines, HistoryLineWrapPolicy::PreWrap);
+    }
+
+    pub fn insert_history_lines_with_wrap_policy(
+        &mut self,
+        lines: Vec<Line<'static>>,
+        wrap_policy: HistoryLineWrapPolicy,
+    ) {
+        if lines.is_empty() {
+            return;
+        }
+        if let Some(last) = self.pending_history_lines.last_mut()
+            && last.wrap_policy == wrap_policy
+        {
+            last.lines.extend(lines);
+        } else {
+            self.pending_history_lines
+                .push(PendingHistoryLines { lines, wrap_policy });
+        }
         self.frame_requester().schedule_frame();
     }
 
@@ -687,8 +784,9 @@ impl Tui {
             area.y = size.height - area.height;
         }
         if area != terminal.viewport_area {
-            // TODO(nornagon): probably this could be collapsed with the clear + set_viewport_area above.
-            terminal.clear()?;
+            // On startup, the old viewport can still be empty. Clear from the
+            // new viewport top so stale shell cells do not show through spaces.
+            clear_for_viewport_change(terminal, area)?;
             terminal.set_viewport_area(area);
         }
 
@@ -767,7 +865,7 @@ impl Tui {
     /// invalidate the diff buffer for a full repaint.
     fn flush_pending_history_lines(
         terminal: &mut Terminal,
-        pending_history_lines: &mut Vec<Line<'static>>,
+        pending_history_lines: &mut Vec<PendingHistoryLines>,
         history_line_cache: &mut Vec<HistoryRow>,
         is_zellij: bool,
     ) -> Result<bool> {
@@ -775,15 +873,23 @@ impl Tui {
             return Ok(false);
         }
 
-        let history_rows = crate::insert_history::history_lines_to_rows(
-            pending_history_lines,
-            terminal.viewport_area.width.max(1) as usize,
-        );
-        crate::insert_history::insert_history_lines_with_mode(
-            terminal,
-            pending_history_lines.clone(),
-            crate::insert_history::InsertHistoryMode::new(is_zellij),
-        )?;
+        let mut history_rows = Vec::new();
+        let wrap_width = terminal.viewport_area.width.max(1) as usize;
+        for batch in pending_history_lines.iter() {
+            history_rows.extend(
+                crate::insert_history::history_lines_to_rows_with_wrap_policy(
+                    &batch.lines,
+                    wrap_width,
+                    batch.wrap_policy,
+                ),
+            );
+            crate::insert_history::insert_history_lines_with_mode_and_wrap_policy(
+                terminal,
+                batch.lines.clone(),
+                crate::insert_history::InsertHistoryMode::new(is_zellij),
+                batch.wrap_policy,
+            )?;
+        }
         pending_history_lines.clear();
         history_line_cache.extend(history_rows);
         trim_history_line_cache(history_line_cache, terminal.visible_history_rows());
@@ -885,6 +991,50 @@ impl Tui {
                 self.mouse_line_selection.render(frame.area(), frame.buffer);
             })
         })?
+    }
+
+    pub fn draw_ambient_pet_image(
+        &mut self,
+        request: Option<crate::pets::AmbientPetDraw>,
+    ) -> std::result::Result<(), crate::pets::PetImageRenderError> {
+        let terminal = &mut self.terminal;
+        let state = &mut self.ambient_pet_image_state;
+        stdout().sync_update(|_| {
+            match crate::pets::render_ambient_pet_image(terminal.backend_mut(), state, request) {
+                Ok(()) => Ok(Ok(())),
+                Err(crate::pets::PetImageRenderError::Terminal(err)) => Err(err),
+                Err(err @ crate::pets::PetImageRenderError::Asset(_)) => Ok(Err(err)),
+            }
+        })??
+    }
+
+    pub fn draw_pet_picker_preview_image(
+        &mut self,
+        request: Option<crate::pets::AmbientPetDraw>,
+    ) -> std::result::Result<(), crate::pets::PetImageRenderError> {
+        let terminal = &mut self.terminal;
+        let state = &mut self.pet_picker_preview_image_state;
+        stdout().sync_update(|_| {
+            match crate::pets::render_pet_picker_preview_image(
+                terminal.backend_mut(),
+                state,
+                request,
+            ) {
+                Ok(()) => Ok(Ok(())),
+                Err(crate::pets::PetImageRenderError::Terminal(err)) => Err(err),
+                Err(err @ crate::pets::PetImageRenderError::Asset(_)) => Ok(Err(err)),
+            }
+        })??
+    }
+
+    pub fn clear_ambient_pet_image(
+        &mut self,
+    ) -> std::result::Result<(), crate::pets::PetImageRenderError> {
+        crate::pets::render_ambient_pet_image(
+            self.terminal.backend_mut(),
+            &mut self.ambient_pet_image_state,
+            /*request*/ None,
+        )
     }
 
     /// Draw a frame using the resize-reflow viewport and history insertion rules.

@@ -67,6 +67,12 @@ impl InsertHistoryMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryLineWrapPolicy {
+    PreWrap,
+    Terminal,
+}
+
 /// Insert `lines` above the viewport using the terminal's backend writer
 /// (avoids direct stdout references).
 pub fn insert_history_lines<B>(
@@ -96,6 +102,23 @@ pub fn insert_history_lines_with_mode<B>(
 where
     B: Backend + Write,
 {
+    insert_history_lines_with_mode_and_wrap_policy(
+        terminal,
+        lines,
+        mode,
+        HistoryLineWrapPolicy::PreWrap,
+    )
+}
+
+pub fn insert_history_lines_with_mode_and_wrap_policy<B>(
+    terminal: &mut crate::custom_terminal::Terminal<B>,
+    lines: Vec<Line>,
+    mode: InsertHistoryMode,
+    wrap_policy: HistoryLineWrapPolicy,
+) -> io::Result<()>
+where
+    B: Backend + Write,
+{
     let screen_size = terminal.backend().size().unwrap_or(Size::new(0, 0));
 
     let mut area = terminal.viewport_area;
@@ -119,12 +142,7 @@ where
     let mut wrapped_rows = 0usize;
 
     for line in &lines {
-        let line_wrapped =
-            if line_contains_url_like(line) && !line_has_mixed_url_and_non_url_tokens(line) {
-                vec![line.clone()]
-            } else {
-                adaptive_wrap_line(line, RtOptions::new(wrap_width))
-            };
+        let line_wrapped = wrap_history_line(line, wrap_width, wrap_policy);
         wrapped_rows += line_wrapped
             .iter()
             .map(|wrapped_line| wrapped_line.width().max(1).div_ceil(wrap_width))
@@ -238,21 +256,21 @@ fn history_lines_to_plain_rows(lines: &[Line<'static>], wrap_width: usize) -> Ve
         .collect()
 }
 
-pub(crate) fn history_lines_to_rows(lines: &[Line<'static>], wrap_width: usize) -> Vec<HistoryRow> {
+#[cfg(test)]
+fn history_lines_to_rows(lines: &[Line<'static>], wrap_width: usize) -> Vec<HistoryRow> {
+    history_lines_to_rows_with_wrap_policy(lines, wrap_width, HistoryLineWrapPolicy::PreWrap)
+}
+
+pub(crate) fn history_lines_to_rows_with_wrap_policy(
+    lines: &[Line<'static>],
+    wrap_width: usize,
+    wrap_policy: HistoryLineWrapPolicy,
+) -> Vec<HistoryRow> {
     let wrap_width = wrap_width.max(1);
     let mut rows = Vec::new();
 
     for line in lines {
-        let wrapped_lines: Vec<Line<'static>> =
-            if line_contains_url_like(line) && !line_has_mixed_url_and_non_url_tokens(line) {
-                vec![line.clone()]
-            } else {
-                adaptive_wrap_line(line, RtOptions::new(wrap_width))
-                    .into_iter()
-                    .map(|wrapped_line| line_to_static(&wrapped_line))
-                    .collect()
-            };
-        for wrapped_line in wrapped_lines {
+        for wrapped_line in wrap_history_line(line, wrap_width, wrap_policy) {
             for physical_line in styled_physical_rows(&wrapped_line, wrap_width) {
                 rows.push(HistoryRow {
                     plain_text: line_plain_text(&physical_line).trim_end().to_string(),
@@ -263,6 +281,25 @@ pub(crate) fn history_lines_to_rows(lines: &[Line<'static>], wrap_width: usize) 
     }
 
     rows
+}
+
+fn wrap_history_line<'a>(
+    line: &'a Line<'a>,
+    wrap_width: usize,
+    wrap_policy: HistoryLineWrapPolicy,
+) -> Vec<Line<'a>> {
+    match wrap_policy {
+        HistoryLineWrapPolicy::Terminal => vec![line.clone()],
+        HistoryLineWrapPolicy::PreWrap
+            if line_contains_url_like(line) && !line_has_mixed_url_and_non_url_tokens(line) =>
+        {
+            vec![line.clone()]
+        }
+        HistoryLineWrapPolicy::PreWrap => adaptive_wrap_line(
+            line,
+            RtOptions::new(wrap_width).subsequent_indent(leading_whitespace_prefix(line)),
+        ),
+    }
 }
 
 pub(crate) fn render_history_rows<W: Write>(
@@ -391,6 +428,27 @@ fn highlighted_line(line: &Line<'static>, start_column: usize, end_column: usize
         alignment: line.alignment,
         spans,
     }
+}
+
+fn leading_whitespace_prefix(line: &Line<'_>) -> Line<'static> {
+    let mut spans = Vec::new();
+    for span in &line.spans {
+        let prefix_end = span
+            .content
+            .char_indices()
+            .find_map(|(idx, ch)| (!ch.is_whitespace()).then_some(idx))
+            .unwrap_or(span.content.len());
+        if prefix_end > 0 {
+            spans.push(Span::styled(
+                span.content[..prefix_end].to_string(),
+                span.style,
+            ));
+        }
+        if prefix_end < span.content.len() {
+            break;
+        }
+    }
+    Line::from(spans).style(line.style)
 }
 
 /// Render a single wrapped history line: clear continuation rows for wide lines,
@@ -961,6 +1019,98 @@ mod tests {
         assert!(
             rows.iter().any(|r| r.contains("tail words")),
             "expected suffix words to wrap as a phrase, rows: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn vt100_prefixed_mixed_url_line_preserves_prefix_on_wrapped_rows() {
+        let width: u16 = 24;
+        let height: u16 = 10;
+        let backend = VT100Backend::new(width, height);
+        let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+        let viewport = Rect::new(
+            /*x*/ 0,
+            /*y*/ height - 1,
+            /*width*/ width,
+            /*height*/ 1,
+        );
+        term.set_viewport_area(viewport);
+
+        let line: Line<'static> = Line::from(vec![
+            "  ".into(),
+            "see https://example.com and enough trailing prose to force another wrapped row".into(),
+        ]);
+
+        insert_history_lines(&mut term, vec![line]).expect("insert mixed history");
+
+        let rows: Vec<String> = term.backend().vt100().screen().rows(0, width).collect();
+        let continuation_row = rows
+            .iter()
+            .find(|row| row.contains("prose to force another"))
+            .unwrap_or_else(|| panic!("expected continuation row in screen rows: {rows:?}"));
+
+        assert!(
+            continuation_row.starts_with("  "),
+            "expected wrapped continuation row to keep the original prefix, rows: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn vt100_prefixed_non_url_line_preserves_prefix_on_wrapped_rows() {
+        let width: u16 = 32;
+        let height: u16 = 10;
+        let backend = VT100Backend::new(width, height);
+        let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+        let viewport = Rect::new(
+            /*x*/ 0,
+            /*y*/ height - 1,
+            /*width*/ width,
+            /*height*/ 1,
+        );
+        term.set_viewport_area(viewport);
+
+        let line = Line::from(
+            "      dog while this deliberately long string tests code block scrolling versus soft wrapping",
+        );
+
+        insert_history_lines(&mut term, vec![line]).expect("insert prefixed history");
+
+        let rows: Vec<String> = term.backend().vt100().screen().rows(0, width).collect();
+        let continuation_row = rows
+            .iter()
+            .find(|row| row.contains("tests code block scrolling"))
+            .unwrap_or_else(|| panic!("expected continuation row in screen rows: {rows:?}"));
+
+        assert!(
+            continuation_row.starts_with("      "),
+            "expected wrapped continuation row to keep the original prefix, rows: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn vt100_terminal_wrap_policy_does_not_pre_wrap_long_paragraph() {
+        let width: u16 = 20;
+        let height: u16 = 8;
+        let backend = VT100Backend::new(width, height);
+        let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+        let viewport = Rect::new(0, height - 1, width, 1);
+        term.set_viewport_area(viewport);
+
+        let line = Line::from("alpha beta gamma delta epsilon zeta");
+
+        insert_history_lines_with_mode_and_wrap_policy(
+            &mut term,
+            vec![line],
+            InsertHistoryMode::Standard,
+            HistoryLineWrapPolicy::Terminal,
+        )
+        .expect("insert raw history");
+
+        let rows: Vec<String> = term.backend().vt100().screen().rows(0, width).collect();
+        assert!(
+            rows.iter()
+                .any(|row| row.trim_end() == "alpha beta gamma del"),
+            "expected terminal soft-wrap instead of Codex word pre-wrap, rows: {rows:?}"
         );
     }
 
